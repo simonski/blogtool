@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"io"
 	"io/fs"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -35,8 +37,13 @@ const (
 	siteTemplatesDir = templatesDir + "/site"
 	indexCSSName     = "index.css"
 	postCSSName      = "post.css"
+	searchJSName     = "search.js"
 	indexFileName    = "index.html"
 )
+
+// siteAssetNames are the templates/site files copied verbatim into output/ on
+// build and refreshed in a workspace by `blog upgrade`.
+var siteAssetNames = []string{indexCSSName, postCSSName, searchJSName}
 
 // Embedded copy of the templates tree so `blog init` (and template fallback)
 // works from an installed binary, away from this repository.
@@ -77,6 +84,7 @@ type post struct {
 	SourcePath string
 	Kind       string // "post" or "idea"
 	IsDraft    bool
+	Labels     []string
 }
 
 // entry is a source item under posts/ or ideas/, used by ls and edit.
@@ -87,6 +95,7 @@ type entry struct {
 	Title   string
 	Updated time.Time
 	Source  string
+	Labels  []string
 }
 
 func main() {
@@ -106,6 +115,8 @@ func main() {
 		err = cmdBuild(args)
 	case "server", "serve":
 		err = cmdServer(args)
+	case "live":
+		err = cmdLive(args)
 	case "post":
 		err = cmdNew("post", args)
 	case "idea":
@@ -114,6 +125,10 @@ func main() {
 		err = cmdList(args)
 	case "edit":
 		err = cmdEdit(args)
+	case "label":
+		err = cmdLabel(args)
+	case "upgrade":
+		err = cmdUpgrade(args)
 	case "version", "-v", "--version":
 		fmt.Println(strings.TrimSpace(embeddedVersion))
 	case "help", "-h", "--help":
@@ -140,10 +155,14 @@ usage:
   blog build [-draft]      build the static site into output/
   blog server [-dir D] [-port P]
                            serve static content (default: current directory, port 8000)
+  blog live [-port P] [-draft]
+                           design-time loop: serve output/, rebuild on save, auto-reload the browser
   blog post ["the title"]  create a new post under posts/{id}_{title}/
   blog idea ["the title"]  create a new idea under ideas/{id}_{title}/
   blog ls                  list posts and ideas, most recent first
   blog edit N              open the source content for entry N in VS Code
+  blog label N a,b         set the labels on post or idea N (replaces existing labels)
+  blog upgrade             refresh templates/site assets from this binary's embedded copies
   blog version             print the blog version
 `)
 }
@@ -211,6 +230,43 @@ deploy: build ## Deploy output/ via rsync
 	}
 
 	fmt.Printf("created %s/\n\nnext steps:\n  cd %s\n  blog post \"my first post\"\n  blog build\n  blog server -dir output\n", target, target)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// upgrade
+
+// cmdUpgrade refreshes the workspace's site assets (stylesheets + search.js)
+// from the copies embedded in this binary, so deploying a newer `blog`
+// release lets any existing blog pick up the current versions. HTML templates
+// and scaffolds are left alone — they carry per-blog customisation.
+func cmdUpgrade(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("unexpected argument %q", args[0])
+	}
+	if _, err := os.Stat(filepath.FromSlash(siteTemplatesDir)); err != nil {
+		return errors.New("no templates/site directory here; run from a blog workspace (see `blog init`)")
+	}
+
+	for _, name := range siteAssetNames {
+		src := siteTemplatesDir + "/" + name
+		embedded, err := embeddedTemplates.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("read embedded %s: %w", src, err)
+		}
+		dst := filepath.FromSlash(src)
+		current, _ := os.ReadFile(dst)
+		if bytes.Equal(current, embedded) {
+			fmt.Printf("%s: already up to date\n", dst)
+			continue
+		}
+		if err := os.WriteFile(dst, embedded, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
+		fmt.Printf("%s: upgraded\n", dst)
+	}
+
+	fmt.Println("\nrun `blog build` to regenerate output/ with the new styles")
 	return nil
 }
 
@@ -417,15 +473,25 @@ func cmdList(args []string) error {
 	})
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTYPE\tUPDATED\tTITLE")
+	fmt.Fprintln(w, "ID\tTYPE\tUPDATED\tTITLE\tLABELS")
 	for _, e := range entries {
 		id := "-"
 		if e.ID > 0 {
 			id = strconv.Itoa(e.ID)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", id, e.Kind, e.Updated.Format("2006-01-02 15:04"), e.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, e.Kind, e.Updated.Format("2006-01-02 15:04"), truncateTitle(e.Title, 35), strings.Join(e.Labels, ","))
 	}
 	return w.Flush()
+}
+
+// truncateTitle caps a title at max runes, marking the cut with an ellipsis,
+// so the labels column stays close to even long titles.
+func truncateTitle(title string, max int) string {
+	runes := []rune(title)
+	if len(runes) <= max {
+		return title
+	}
+	return string(runes[:max]) + "…"
 }
 
 func collectEntries() ([]entry, error) {
@@ -456,8 +522,11 @@ func collectEntries() ([]entry, error) {
 				if info, statErr := os.Stat(mdPath); statErr == nil {
 					e.Updated = info.ModTime()
 				}
-				if parsed, parseErr := parsePost(mdPath, de.Name(), kd.kind, false); parseErr == nil && parsed.Title != "" {
-					e.Title = parsed.Title
+				if parsed, parseErr := parsePost(mdPath, de.Name(), kd.kind, false); parseErr == nil {
+					if parsed.Title != "" {
+						e.Title = parsed.Title
+					}
+					e.Labels = parsed.Labels
 				}
 			}
 			entries = append(entries, e)
@@ -500,6 +569,106 @@ func cmdEdit(args []string) error {
 }
 
 // ---------------------------------------------------------------------------
+// label
+
+// cmdLabel sets the labels metadata on a post or idea, replacing any
+// existing labels line in its front matter.
+func cmdLabel(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: blog label N label[,label...]")
+	}
+	id, err := strconv.Atoi(args[0])
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid id %q", args[0])
+	}
+	labels := parseLabels(strings.Join(args[1:], " "))
+	if len(labels) == 0 {
+		return errors.New("no labels given")
+	}
+
+	entries, err := collectEntries()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.ID != id {
+			continue
+		}
+		if e.Source == "" {
+			return fmt.Errorf("entry %d has no markdown source to label", id)
+		}
+		data, readErr := os.ReadFile(e.Source)
+		if readErr != nil {
+			return fmt.Errorf("read %s: %w", e.Source, readErr)
+		}
+		updated := setLabelsInSource(string(data), strings.Join(labels, ", "))
+		if writeErr := os.WriteFile(e.Source, []byte(updated), 0o644); writeErr != nil {
+			return fmt.Errorf("write %s: %w", e.Source, writeErr)
+		}
+		fmt.Printf("labelled %s: %s\n", e.Source, strings.Join(labels, ", "))
+		return nil
+	}
+	return fmt.Errorf("no post or idea with id %d (see `blog ls`)", id)
+}
+
+// setLabelsInSource rewrites markdown content so its front matter carries the
+// given labels value, mirroring the shapes parseFrontMatter accepts: a fenced
+// `---` block, a bare title:/date: metadata run, or no front matter at all
+// (in which case a fenced block is prepended).
+func setLabelsInSource(content string, labelsValue string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	labelLine := "labels: " + labelsValue
+
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+
+	if start < len(lines) && strings.TrimSpace(lines[start]) == "---" {
+		for i := start + 1; i < len(lines); i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			if trimmed == "" || trimmed == "---" {
+				out := append([]string(nil), lines[:i]...)
+				out = append(out, labelLine)
+				return strings.Join(append(out, lines[i:]...), "\n")
+			}
+			if key, _, ok := parseMetadataLine(lines[i]); ok && key == "labels" {
+				lines[i] = labelLine
+				return strings.Join(lines, "\n")
+			}
+		}
+		return strings.Join(append(lines, labelLine), "\n")
+	}
+
+	if start < len(lines) {
+		if key, _, ok := parseMetadataLine(lines[start]); ok && (key == "title" || key == "date") {
+			end := start + 1
+			for end < len(lines) {
+				trimmed := strings.TrimSpace(lines[end])
+				if trimmed == "" {
+					break
+				}
+				key, _, ok := parseMetadataLine(lines[end])
+				if !ok {
+					break
+				}
+				if key == "labels" {
+					lines[end] = labelLine
+					return strings.Join(lines, "\n")
+				}
+				end++
+			}
+			out := append([]string(nil), lines[:end]...)
+			out = append(out, labelLine)
+			return strings.Join(append(out, lines[end:]...), "\n")
+		}
+	}
+
+	return "---\n" + labelLine + "\n---\n\n" + content
+}
+
+// ---------------------------------------------------------------------------
 // server
 
 func cmdServer(args []string) error {
@@ -517,6 +686,171 @@ func cmdServer(args []string) error {
 	addr := fmt.Sprintf("localhost:%d", *port)
 	fmt.Printf("serving %s on http://%s\n", *dir, addr)
 	return http.ListenAndServe(addr, http.FileServer(http.Dir(*dir)))
+}
+
+// ---------------------------------------------------------------------------
+// live
+//
+// `blog live` is a design-time loop: build, serve output/, watch the source
+// dirs by polling mtimes, rebuild on change and tell connected browsers to
+// reload over Server-Sent Events. The reload script is injected into HTML at
+// serve time only — nothing in output/ is modified, so deployed output stays
+// fully static.
+
+const liveReloadScript = `<script>(function(){var es=new EventSource("/__reload");es.addEventListener("reload",function(){location.reload();});})();</script>`
+
+type liveReloader struct {
+	mu      sync.Mutex
+	clients map[chan struct{}]struct{}
+}
+
+func newLiveReloader() *liveReloader {
+	return &liveReloader{clients: map[chan struct{}]struct{}{}}
+}
+
+func (lr *liveReloader) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	lr.mu.Lock()
+	lr.clients[ch] = struct{}{}
+	lr.mu.Unlock()
+	return ch
+}
+
+func (lr *liveReloader) unsubscribe(ch chan struct{}) {
+	lr.mu.Lock()
+	delete(lr.clients, ch)
+	lr.mu.Unlock()
+}
+
+func (lr *liveReloader) broadcast() {
+	lr.mu.Lock()
+	for ch := range lr.clients {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	lr.mu.Unlock()
+}
+
+func (lr *liveReloader) serveSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	ch := lr.subscribe()
+	defer lr.unsubscribe(ch)
+
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ch:
+			fmt.Fprint(w, "event: reload\ndata: now\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// serveWithReload serves output/, injecting the reload script into HTML pages.
+func serveWithReload(w http.ResponseWriter, r *http.Request) {
+	path := filepath.Join(outputDir, filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		path = filepath.Join(path, indexFileName)
+	}
+	if strings.HasSuffix(path, ".html") {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			page := string(data)
+			if idx := strings.LastIndex(page, "</body>"); idx >= 0 {
+				page = page[:idx] + liveReloadScript + "\n" + page[idx:]
+			} else {
+				page += liveReloadScript
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, page)
+			return
+		}
+	}
+	http.FileServer(http.Dir(outputDir)).ServeHTTP(w, r)
+}
+
+// sourceFingerprint folds the paths, sizes and mtimes of everything under the
+// source dirs into a single hash so the watcher can detect any change.
+func sourceFingerprint() uint64 {
+	h := fnv.New64a()
+	for _, root := range []string{postsDir, ideasDir, draftsDir, templatesDir} {
+		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			fmt.Fprint(h, path)
+			if info, infoErr := d.Info(); infoErr == nil {
+				fmt.Fprintf(h, "%d%d", info.Size(), info.ModTime().UnixNano())
+			}
+			return nil
+		})
+	}
+	return h.Sum64()
+}
+
+func cmdLive(args []string) error {
+	fs := flag.NewFlagSet("live", flag.ContinueOnError)
+	port := fs.Int("port", 8000, "port to listen on")
+	includeDrafts := fs.Bool("draft", false, "include posts from drafts")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if err := buildSite(*includeDrafts); err != nil {
+		return err
+	}
+
+	reloader := newLiveReloader()
+
+	go func() {
+		last := sourceFingerprint()
+		for {
+			time.Sleep(300 * time.Millisecond)
+			current := sourceFingerprint()
+			if current == last {
+				continue
+			}
+			// Debounce: wait for the fingerprint to settle so a burst of
+			// saves triggers a single rebuild.
+			for {
+				time.Sleep(150 * time.Millisecond)
+				next := sourceFingerprint()
+				if next == current {
+					break
+				}
+				current = next
+			}
+			last = current
+			fmt.Printf("[%s] change detected, rebuilding... ", time.Now().Format("15:04:05"))
+			if err := buildSite(*includeDrafts); err != nil {
+				fmt.Printf("build failed: %v\n", err)
+				continue
+			}
+			fmt.Println("ok")
+			reloader.broadcast()
+		}
+	}()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__reload", reloader.serveSSE)
+	mux.HandleFunc("/", serveWithReload)
+
+	addr := fmt.Sprintf("localhost:%d", *port)
+	fmt.Printf("live mode: serving %s on http://%s (edit sources; pages reload on save)\n", outputDir, addr)
+	return http.ListenAndServe(addr, mux)
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +874,7 @@ func buildSite(includeDrafts bool) error {
 	if err := resetOutputDir(); err != nil {
 		return err
 	}
-	if err := copyStylesheets(); err != nil {
+	if err := copySiteAssets(); err != nil {
 		return err
 	}
 
@@ -580,7 +914,68 @@ func buildSite(includeDrafts bool) error {
 	if err := renderIndex(posts, ideas, tmpl); err != nil {
 		return err
 	}
+	if err := renderFeed(posts, ideas); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// renderFeed writes an Atom feed to output/atom.xml covering every post and
+// idea, with labels (and the entry kind) as categories and the rendered HTML
+// as content. Links are relative to the site root; besides feed readers it is
+// the search index for the double-shift search popup.
+func renderFeed(posts []post, ideas []post) error {
+	now := time.Now()
+	entryTime := func(p post) time.Time {
+		if p.Date.IsZero() {
+			return now
+		}
+		return p.Date
+	}
+
+	all := append(append([]post(nil), posts...), ideas...)
+	updated := now
+	for i, p := range all {
+		if i == 0 || entryTime(p).After(updated) {
+			updated = entryTime(p)
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
+	b.WriteString("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n")
+	b.WriteString("  <title>Blog</title>\n")
+	b.WriteString("  <id>urn:blogtool:feed</id>\n")
+	fmt.Fprintf(&b, "  <updated>%s</updated>\n", updated.Format(time.RFC3339))
+	fmt.Fprintf(&b, "  <generator version=\"%s\">blogtool</generator>\n", strings.TrimSpace(embeddedVersion))
+	b.WriteString("  <link rel=\"self\" href=\"atom.xml\"/>\n")
+
+	for _, p := range all {
+		var rendered bytes.Buffer
+		if err := mdEngine.Convert([]byte(p.Body), &rendered); err != nil {
+			return fmt.Errorf("render %s for feed: %w", p.SourcePath, err)
+		}
+		href := filepath.ToSlash(p.Slug) + "/"
+
+		b.WriteString("  <entry>\n")
+		fmt.Fprintf(&b, "    <title>%s</title>\n", html.EscapeString(p.Title))
+		fmt.Fprintf(&b, "    <id>urn:blogtool:%s</id>\n", html.EscapeString(filepath.ToSlash(p.Slug)))
+		fmt.Fprintf(&b, "    <link rel=\"alternate\" type=\"text/html\" href=\"%s\"/>\n", html.EscapeString(href))
+		fmt.Fprintf(&b, "    <updated>%s</updated>\n", entryTime(p).Format(time.RFC3339))
+		fmt.Fprintf(&b, "    <category scheme=\"urn:blogtool:kind\" term=\"%s\"/>\n", html.EscapeString(p.Kind))
+		for _, label := range p.Labels {
+			fmt.Fprintf(&b, "    <category term=\"%s\"/>\n", html.EscapeString(label))
+		}
+		fmt.Fprintf(&b, "    <content type=\"html\">%s</content>\n", html.EscapeString(rendered.String()))
+		b.WriteString("  </entry>\n")
+	}
+	b.WriteString("</feed>\n")
+
+	feedPath := filepath.Join(outputDir, "atom.xml")
+	if err := os.WriteFile(feedPath, []byte(b.String()), 0o644); err != nil {
+		return fmt.Errorf("write atom feed: %w", err)
+	}
 	return nil
 }
 
@@ -639,8 +1034,8 @@ func resetOutputDir() error {
 	return nil
 }
 
-func copyStylesheets() error {
-	for _, name := range []string{indexCSSName, postCSSName} {
+func copySiteAssets() error {
+	for _, name := range siteAssetNames {
 		content, err := readTemplate(siteTemplatesDir + "/" + name)
 		if err != nil {
 			return err
@@ -732,10 +1127,12 @@ func parsePost(path string, slug string, kind string, isDraft bool) (post, error
 		return post{}, fmt.Errorf("read markdown %s: %w", path, err)
 	}
 
-	title, dateRaw, body := parseFrontMatter(string(data))
+	meta, body := parseFrontMatter(string(data))
+	title := meta["title"]
 	if title == "" {
 		title = inferTitle(body, path)
 	}
+	dateRaw := meta["date"]
 	if dateRaw == "" {
 		dateRaw = inferDate(string(data))
 	}
@@ -751,10 +1148,11 @@ func parsePost(path string, slug string, kind string, isDraft bool) (post, error
 		SourcePath: path,
 		Kind:       kind,
 		IsDraft:    isDraft,
+		Labels:     parseLabels(meta["labels"]),
 	}, nil
 }
 
-func parseFrontMatter(markdown string) (title string, date string, body string) {
+func parseFrontMatter(markdown string) (meta map[string]string, body string) {
 	content := strings.ReplaceAll(markdown, "\r\n", "\n")
 	content = strings.TrimPrefix(content, "\uFEFF")
 	lines := strings.Split(content, "\n")
@@ -764,7 +1162,7 @@ func parseFrontMatter(markdown string) (title string, date string, body string) 
 		start++
 	}
 	if start >= len(lines) {
-		return "", "", ""
+		return map[string]string{}, ""
 	}
 
 	metadata := map[string]string{}
@@ -788,7 +1186,7 @@ func parseFrontMatter(markdown string) (title string, date string, body string) 
 	} else {
 		key, value, ok := parseMetadataLine(lines[start])
 		if !ok || (key != "title" && key != "date") {
-			return "", "", content
+			return map[string]string{}, content
 		}
 		metadata[key] = value
 		bodyStart = start + 1
@@ -819,7 +1217,18 @@ func parseFrontMatter(markdown string) (title string, date string, body string) 
 		bodyLines = bodyLines[:len(bodyLines)-1]
 	}
 
-	return metadata["title"], metadata["date"], strings.Join(bodyLines, "\n")
+	return metadata, strings.Join(bodyLines, "\n")
+}
+
+// parseLabels splits a comma-separated labels value into trimmed labels.
+func parseLabels(raw string) []string {
+	var labels []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			labels = append(labels, trimmed)
+		}
+	}
+	return labels
 }
 
 func parseMetadataLine(line string) (key string, value string, ok bool) {
@@ -930,8 +1339,12 @@ func renderPost(p post, tmpl templates) error {
 		return fmt.Errorf("resolve css path for %s: %w", p.Slug, err)
 	}
 	cssHref := postCSSName
+	searchHref := searchJSName
+	rootPrefix := ""
 	if relToRoot != "." {
 		cssHref = filepath.ToSlash(filepath.Join(relToRoot, postCSSName))
+		searchHref = filepath.ToSlash(filepath.Join(relToRoot, searchJSName))
+		rootPrefix = filepath.ToSlash(relToRoot) + "/"
 	}
 
 	header := rewriteIndexLinks(tmpl.Header[p.Kind], relToRoot)
@@ -944,14 +1357,15 @@ func renderPost(p post, tmpl templates) error {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>%s</title>
   <link rel="stylesheet" href="%s">
+  <script src="%s" defer data-blog-root="%s"></script>
 </head>
 <body>
 %s
 %s
 %s
-</body>
+%s</body>
 </html>
-`, html.EscapeString(p.Title), cssHref, header, rendered.String(), footer)
+`, html.EscapeString(p.Title), cssHref, searchHref, rootPrefix, header, rendered.String(), footer, generatorFooter())
 
 	postPath := filepath.Join(postDir, indexFileName)
 	if err := os.WriteFile(postPath, []byte(page), 0o644); err != nil {
@@ -959,6 +1373,12 @@ func renderPost(p post, tmpl templates) error {
 	}
 
 	return nil
+}
+
+// generatorFooter is appended to every generated page: a discreet credit
+// naming the blogtool version that produced the output.
+func generatorFooter() string {
+	return fmt.Sprintf("<footer class=\"made-with\">made using <a href=\"https://github.com/simonski/blogtool\">blogtool</a> v%s</footer>\n", strings.TrimSpace(embeddedVersion))
 }
 
 func rewriteIndexLinks(content string, relToRoot string) string {
@@ -1089,32 +1509,38 @@ func seasonLabel(t time.Time) string {
 }
 
 func renderIndex(posts []post, ideas []post, tmpl templates) error {
-	var links strings.Builder
+	var postCol strings.Builder
 	currentSeason := ""
 	open := false
 	for _, p := range posts {
 		season := seasonLabel(p.Date)
 		if season != currentSeason {
 			if open {
-				links.WriteString("  </ul>\n</div>\n")
+				postCol.WriteString("  </ul>\n</div>\n")
 			}
-			links.WriteString(fmt.Sprintf("<div class=\"season\">\n  <span class=\"season-date\">%s</span>\n  <ul>\n", html.EscapeString(season)))
+			postCol.WriteString(fmt.Sprintf("<div class=\"season\">\n  <span class=\"season-date\">%s</span>\n  <ul>\n", html.EscapeString(season)))
 			currentSeason = season
 			open = true
 		}
-		links.WriteString(indexLink(p))
+		postCol.WriteString(indexLink(p))
 	}
 	if open {
-		links.WriteString("  </ul>\n</div>\n")
+		postCol.WriteString("  </ul>\n</div>\n")
 	}
 
+	// Posts on the left, ideas as a free-form second column on the right.
+	var links strings.Builder
+	links.WriteString("<div class=\"columns\">\n<div class=\"col col-posts\">\n")
+	links.WriteString(postCol.String())
+	links.WriteString("</div>\n")
 	if len(ideas) > 0 {
-		links.WriteString("<div class=\"season\">\n  <span class=\"season-date\">ideas</span>\n  <ul>\n")
+		links.WriteString("<div class=\"col col-ideas\">\n<div class=\"season\">\n  <span class=\"season-date\">ideas</span>\n  <ul>\n")
 		for _, p := range ideas {
 			links.WriteString(indexLink(p))
 		}
-		links.WriteString("  </ul>\n</div>\n")
+		links.WriteString("  </ul>\n</div>\n</div>\n")
 	}
+	links.WriteString("</div>\n")
 
 	page := fmt.Sprintf(`<!doctype html>
 <html lang="en">
@@ -1123,14 +1549,15 @@ func renderIndex(posts []post, ideas []post, tmpl templates) error {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Blog</title>
   <link rel="stylesheet" href="%s">
+  <script src="%s" defer data-blog-root=""></script>
 </head>
 <body>
 %s
 %s
 %s
-</body>
+%s</body>
 </html>
-`, indexCSSName, tmpl.IndexHeader, links.String(), tmpl.IndexFooter)
+`, indexCSSName, searchJSName, tmpl.IndexHeader, links.String(), tmpl.IndexFooter, generatorFooter())
 
 	indexPath := filepath.Join(outputDir, indexFileName)
 	if err := os.WriteFile(indexPath, []byte(page), 0o644); err != nil {

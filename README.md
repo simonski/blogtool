@@ -26,12 +26,32 @@ blog init                create a new "blog" folder (fails if it already exists)
 blog build [-draft]      build the static site into output/
 blog server [-dir D] [-port P]
                          serve static content (default: current directory, port 8000)
+blog live [-port P] [-draft]
+                         design-time loop: serve output/, rebuild on save, auto-reload the browser
 blog post ["the title"]  create a new post under posts/{id}_{title}/
 blog idea ["the title"]  create a new idea under ideas/{id}_{title}/
 blog ls                  list posts and ideas, most recent first
 blog edit N              open the source content for entry N in VS Code
+blog label N a,b         set the labels on post or idea N (replaces existing labels)
+blog upgrade             refresh templates/site assets from this binary's embedded copies
 blog version             print the blog version
 ```
+
+The index page renders posts on the left with ideas as a second, free-form
+column on the right. The site assets that drive this (`index.css`, `post.css`,
+`search.js`) live in `templates/site/` in each blog workspace; after installing
+a newer `blog` binary, run `blog upgrade` inside a workspace to bring them up
+to date (HTML templates and scaffolds are never touched — they carry per-blog
+customisation).
+
+Every build also emits `output/atom.xml`, an Atom feed of all posts and ideas
+with their labels as categories and full rendered content. On any generated
+page, pressing Shift twice quickly opens a search popup that uses the feed as
+its client-side index — searching titles, labels and body text with no server
+component, so the deployed site stays fully static. `blog live` gives a
+design-time loop: it serves `output/`, rebuilds when a source file is saved,
+and auto-reloads the browser over Server-Sent Events (the reload script is
+injected at serve time only and never written into `output/`).
 
 A blog workspace (as created by `blog init`) looks like:
 

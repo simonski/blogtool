@@ -21,3 +21,14 @@ img {
     display: block;
     margin: 1em auto;
 }
+.made-with {
+    margin-top: 4em;
+    font-family: monospace;
+    font-size: 0.75em;
+    color: #bbb;
+    text-align: center;
+}
+
+.made-with a {
+    color: #bbb;
+}
