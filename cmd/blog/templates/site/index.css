@@ -1,0 +1,55 @@
+/* post.css - styles for individual blog posts */
+body {
+    font-family: Georgia, serif;
+    background: #fff;
+    color: #222;
+    margin: 0;
+    padding: 2em;
+    max-width: 700px;
+    margin-left: auto;
+    margin-right: auto;
+}
+h1, h2, h3 {
+    color: #007acc;
+}
+p {
+    line-height: 1.6;
+    margin-bottom: 1em;
+}
+img {
+    max-width: 100%;
+    display: block;
+    margin: 1em auto;
+}
+
+.date {
+    font-family: monospace;
+    font-size: 0.85em;
+    color: #999;
+    display: block;
+    margin-bottom: 0.2em;
+}
+
+.group {
+    margin-bottom: 1.5em;
+}
+
+.group ul {
+    margin-top: 0.2em;
+    padding-left: 0;
+    list-style: none;
+}
+
+a {
+    font-family: monospace;
+    color: #5a9ab5;
+}
+
+a:visited {
+    color: #5a9ab5;
+}
+
+a:active {
+    color: #5a9ab5;
+}
+
