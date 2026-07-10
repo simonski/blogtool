@@ -1,6 +1,6 @@
 /* index.css - styles for the blog index page */
 body {
-    font-family: Georgia, serif;
+    font-family: monospace;
     background: #fff;
     color: #222;
     margin: 0;
@@ -10,36 +10,15 @@ body {
     margin-right: auto;
 }
 
-/* Two-column layout: posts on the left, ideas (free-form, open-ended)
-   as a narrower column on the right. */
-.columns {
-    display: flex;
-    gap: 3em;
-    align-items: flex-start;
+/* Top navigation bar between the blog (posts) and ideas list pages; the
+   current section renders as a plain word, the other as a link. */
+header nav a,
+header nav .current {
+    margin-right: 1.5em;
 }
 
-.col {
-    min-width: 0;
-}
-
-.col-posts {
-    flex: 2;
-}
-
-.col-ideas {
-    flex: 1;
-    border-left: 1px solid #eee;
-    padding-left: 2em;
-}
-
-@media (max-width: 640px) {
-    .columns {
-        flex-direction: column;
-    }
-    .col-ideas {
-        border-left: none;
-        padding-left: 0;
-    }
+header nav .current {
+    color: #222;
 }
 
 .made-with {

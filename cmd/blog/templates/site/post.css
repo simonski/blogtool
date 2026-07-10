@@ -1,11 +1,11 @@
-/* post.css - styles for individual blog posts */
+/* post.css - styles for individual blog posts and ideas */
 body {
-    font-family: Georgia, serif;
+    font-family: monospace;
     background: #fff;
     color: #222;
     margin: 0;
     padding: 2em;
-    max-width: 700px;
+    max-width: 960px;
     margin-left: auto;
     margin-right: auto;
 }
@@ -31,4 +31,13 @@ img {
 
 .made-with a {
     color: #bbb;
+}
+
+header nav a,
+header nav .current {
+    margin-right: 1.5em;
+}
+
+header nav .current {
+    color: #222;
 }

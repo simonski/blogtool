@@ -30,7 +30,9 @@ build: ## Assemble the blog binary into bin/
 	@mkdir -p bin
 	go build -o bin/blog ./cmd/blog
 
-install: ## Install the blog binary onto the PATH (go install)
+install: ## Bump the patch version, build bin/blog, and install it onto the PATH (go install)
+	@$(MAKE) bump-version
+	@$(MAKE) build
 	go install ./cmd/blog
 
 test: ## Vet and test

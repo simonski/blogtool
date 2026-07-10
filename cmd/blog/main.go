@@ -38,12 +38,14 @@ const (
 	indexCSSName     = "index.css"
 	postCSSName      = "post.css"
 	searchJSName     = "search.js"
+	navJSName        = "nav.js"
 	indexFileName    = "index.html"
+	ideasFileName    = "ideas.html"
 )
 
 // siteAssetNames are the templates/site files copied verbatim into output/ on
 // build and refreshed in a workspace by `blog upgrade`.
-var siteAssetNames = []string{indexCSSName, postCSSName, searchJSName}
+var siteAssetNames = []string{indexCSSName, postCSSName, searchJSName, navJSName}
 
 // Embedded copy of the templates tree so `blog init` (and template fallback)
 // works from an installed binary, away from this repository.
@@ -96,6 +98,7 @@ type entry struct {
 	Updated time.Time
 	Source  string
 	Labels  []string
+	IsDraft bool
 }
 
 func main() {
@@ -129,6 +132,10 @@ func main() {
 		err = cmdLabel(args)
 	case "upgrade":
 		err = cmdUpgrade(args)
+	case "editor":
+		err = cmdEditor(args)
+	case "reset-password":
+		err = cmdResetPassword(args)
 	case "version", "-v", "--version":
 		fmt.Println(strings.TrimSpace(embeddedVersion))
 	case "help", "-h", "--help":
@@ -153,8 +160,8 @@ usage:
   blog                     show this usage
   blog init                create a new "blog" folder (fails if it already exists)
   blog build [-draft]      build the static site into output/
-  blog server [-dir D] [-port P]
-                           serve static content (default: current directory, port 8000)
+  blog serve [-dir D] [-port P]
+                           serve the built site from output/ (port 8000)
   blog live [-port P] [-draft]
                            design-time loop: serve output/, rebuild on save, auto-reload the browser
   blog post ["the title"]  create a new post under posts/{id}_{title}/
@@ -163,6 +170,8 @@ usage:
   blog edit N              open the source content for entry N in VS Code
   blog label N a,b         set the labels on post or idea N (replaces existing labels)
   blog upgrade             refresh templates/site assets from this binary's embedded copies
+  blog editor [-port P]    log in and write, edit and publish posts in the browser
+  blog reset-password      set the editor admin password (terminal only)
   blog version             print the blog version
 `)
 }
@@ -206,8 +215,6 @@ func cmdInit(args []string) error {
 
 	makefile := `.DEFAULT_GOAL := help
 
-DEPLOY_TARGET ?= blog.simonski.com:./blog/
-
 .PHONY: help build run deploy
 
 help: ## Show available commands
@@ -217,29 +224,50 @@ build: ## Build the static site into output/
 	blog build
 
 run: ## Serve output/ on http://localhost:8000
-	blog server -dir output
+	blog serve
 
-deploy: build ## Deploy output/ via rsync
-	rsync -avz --delete output/ $(DEPLOY_TARGET)
+deploy: build ## Sync output/ to the web host (see deploy.sh)
+	./deploy.sh
 `
 	if err := os.WriteFile(filepath.Join(target, "Makefile"), []byte(makefile), 0o644); err != nil {
 		return fmt.Errorf("write Makefile: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(target, ".gitignore"), []byte("output/\n"), 0o644); err != nil {
+
+	deploySh := `#!/bin/sh
+# deploy.sh - sync the generated site to the web host.
+# Override the destination with: DEPLOY_TARGET=user@host:path ./deploy.sh
+set -e
+
+TARGET="${DEPLOY_TARGET:-blog.simonski.com:blog}"
+
+if [ ! -d output ]; then
+	echo "no output/ directory; run 'blog build' first" >&2
+	exit 1
+fi
+
+echo "deploying output/ to $TARGET"
+rsync -avz --delete output/ "$TARGET/"
+`
+	if err := os.WriteFile(filepath.Join(target, "deploy.sh"), []byte(deploySh), 0o755); err != nil {
+		return fmt.Errorf("write deploy.sh: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".gitignore"), []byte("output/\n"+authDBName+"\n"), 0o644); err != nil {
 		return fmt.Errorf("write .gitignore: %w", err)
 	}
 
-	fmt.Printf("created %s/\n\nnext steps:\n  cd %s\n  blog post \"my first post\"\n  blog build\n  blog server -dir output\n", target, target)
+	fmt.Printf("created %s/\n\nnext steps:\n  cd %s\n  blog post \"my first post\"\n  blog build\n  blog serve\n", target, target)
 	return nil
 }
 
 // ---------------------------------------------------------------------------
 // upgrade
 
-// cmdUpgrade refreshes the workspace's site assets (stylesheets + search.js)
+// cmdUpgrade refreshes the workspace's site assets (stylesheets + scripts)
 // from the copies embedded in this binary, so deploying a newer `blog`
 // release lets any existing blog pick up the current versions. HTML templates
-// and scaffolds are left alone — they carry per-blog customisation.
+// and scaffolds are left alone — they carry per-blog customisation — except
+// header templates still matching an old blogtool scaffold, which are
+// replaced now that the navigation bar is generated into every page.
 func cmdUpgrade(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("unexpected argument %q", args[0])
@@ -266,8 +294,59 @@ func cmdUpgrade(args []string) error {
 		fmt.Printf("%s: upgraded\n", dst)
 	}
 
+	headerTemplates := []string{
+		siteTemplatesDir + "/index_header.html",
+		templatesDir + "/" + postsDir + "/_header.html",
+		templatesDir + "/" + ideasDir + "/_header.html",
+	}
+	for _, src := range headerTemplates {
+		dst := filepath.FromSlash(src)
+		current, err := os.ReadFile(dst)
+		if err != nil {
+			continue
+		}
+		embedded, err := embeddedTemplates.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("read embedded %s: %w", src, err)
+		}
+		if bytes.Equal(current, embedded) {
+			fmt.Printf("%s: already up to date\n", dst)
+			continue
+		}
+		if !isLegacyHeader(string(current)) {
+			fmt.Printf("%s: customised, left alone\n", dst)
+			continue
+		}
+		if err := os.WriteFile(dst, embedded, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
+		fmt.Printf("%s: upgraded (the navigation bar is now generated into every page)\n", dst)
+	}
+
 	fmt.Println("\nrun `blog build` to regenerate output/ with the new styles")
 	return nil
+}
+
+// legacyHeaderBodies are the header templates old blogtool scaffolds shipped
+// (comments stripped, whitespace collapsed). Headers still matching one carry
+// no customisation and are safe for cmdUpgrade to replace.
+var legacyHeaderBodies = []string{
+	`<header> <h1>blog</h1> <hr> </header>`,
+	`<header> <nav> <a href="index.html">Home</a> </nav> <hr> </header>`,
+	`<header> <nav> <a href="index.html">blog</a> <a href="ideas.html">ideas</a> </nav> <hr> </header>`,
+}
+
+var htmlCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+func isLegacyHeader(content string) bool {
+	stripped := htmlCommentPattern.ReplaceAllString(content, "")
+	normalized := strings.Join(strings.Fields(stripped), " ")
+	for _, legacy := range legacyHeaderBodies {
+		if normalized == legacy {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -284,29 +363,43 @@ func cmdNew(kind string, args []string) error {
 		}
 		title = strings.TrimSpace(line)
 	}
+	destDir, id, err := createEntry(kind, title, false)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("created %s %d: %s\n", kind, id, destDir)
+	return nil
+}
+
+// createEntry scaffolds a new post or idea and returns its folder and id.
+// With draft set, the entry's front matter carries `draft: true` so it stays
+// out of public builds until published.
+func createEntry(kind string, title string, draft bool) (string, int, error) {
+	title = strings.TrimSpace(title)
 	if title == "" {
-		return errors.New("a title is required")
+		return "", 0, errors.New("a title is required")
 	}
 
 	slug := compressTitle(title)
 	if slug == "" {
-		return fmt.Errorf("title %q produces an empty folder name", title)
+		return "", 0, fmt.Errorf("title %q produces an empty folder name", title)
 	}
 
 	baseDir := kindDir(kind)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", baseDir, err)
+		return "", 0, fmt.Errorf("create %s: %w", baseDir, err)
 	}
 
 	if existing, err := findExisting(baseDir, slug); err != nil {
-		return err
+		return "", 0, err
 	} else if existing != "" {
-		return fmt.Errorf("%s %q already exists: %s", kind, title, existing)
+		return "", 0, fmt.Errorf("%s %q already exists: %s", kind, title, existing)
 	}
 
 	id, err := nextID()
 	if err != nil {
-		return err
+		return "", 0, err
 	}
 
 	destDir := filepath.Join(baseDir, fmt.Sprintf("%d_%s", id, slug))
@@ -320,11 +413,25 @@ func cmdNew(kind string, args []string) error {
 	if err := scaffold(kind, destDir, tokens); err != nil {
 		// Do not leave a half-created entry behind.
 		os.RemoveAll(destDir)
-		return err
+		return "", 0, err
 	}
 
-	fmt.Printf("created %s %d: %s\n", kind, id, destDir)
-	return nil
+	if draft {
+		if mdPath, mdErr := findSingleMarkdown(destDir); mdErr == nil && mdPath != "" {
+			data, readErr := os.ReadFile(mdPath)
+			if readErr != nil {
+				os.RemoveAll(destDir)
+				return "", 0, fmt.Errorf("read %s: %w", mdPath, readErr)
+			}
+			updated := setMetadataInSource(string(data), "draft", "true")
+			if writeErr := os.WriteFile(mdPath, []byte(updated), 0o644); writeErr != nil {
+				os.RemoveAll(destDir)
+				return "", 0, fmt.Errorf("write %s: %w", mdPath, writeErr)
+			}
+		}
+	}
+
+	return destDir, id, nil
 }
 
 func kindDir(kind string) string {
@@ -479,7 +586,11 @@ func cmdList(args []string) error {
 		if e.ID > 0 {
 			id = strconv.Itoa(e.ID)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, e.Kind, e.Updated.Format("2006-01-02 15:04"), truncateTitle(e.Title, 35), strings.Join(e.Labels, ","))
+		kind := e.Kind
+		if e.IsDraft {
+			kind += " (draft)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, kind, e.Updated.Format("2006-01-02 15:04"), truncateTitle(e.Title, 35), strings.Join(e.Labels, ","))
 	}
 	return w.Flush()
 }
@@ -527,6 +638,7 @@ func collectEntries() ([]entry, error) {
 						e.Title = parsed.Title
 					}
 					e.Labels = parsed.Labels
+					e.IsDraft = parsed.IsDraft
 				}
 			}
 			entries = append(entries, e)
@@ -601,7 +713,7 @@ func cmdLabel(args []string) error {
 		if readErr != nil {
 			return fmt.Errorf("read %s: %w", e.Source, readErr)
 		}
-		updated := setLabelsInSource(string(data), strings.Join(labels, ", "))
+		updated := setMetadataInSource(string(data), "labels", strings.Join(labels, ", "))
 		if writeErr := os.WriteFile(e.Source, []byte(updated), 0o644); writeErr != nil {
 			return fmt.Errorf("write %s: %w", e.Source, writeErr)
 		}
@@ -611,14 +723,14 @@ func cmdLabel(args []string) error {
 	return fmt.Errorf("no post or idea with id %d (see `blog ls`)", id)
 }
 
-// setLabelsInSource rewrites markdown content so its front matter carries the
-// given labels value, mirroring the shapes parseFrontMatter accepts: a fenced
-// `---` block, a bare title:/date: metadata run, or no front matter at all
-// (in which case a fenced block is prepended).
-func setLabelsInSource(content string, labelsValue string) string {
+// setMetadataInSource rewrites markdown content so its front matter carries
+// the given key/value, mirroring the shapes parseFrontMatter accepts: a
+// fenced `---` block, a bare title:/date: metadata run, or no front matter at
+// all (in which case a fenced block is prepended).
+func setMetadataInSource(content string, metaKey string, value string) string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	lines := strings.Split(content, "\n")
-	labelLine := "labels: " + labelsValue
+	metaLine := metaKey + ": " + value
 
 	start := 0
 	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
@@ -630,15 +742,15 @@ func setLabelsInSource(content string, labelsValue string) string {
 			trimmed := strings.TrimSpace(lines[i])
 			if trimmed == "" || trimmed == "---" {
 				out := append([]string(nil), lines[:i]...)
-				out = append(out, labelLine)
+				out = append(out, metaLine)
 				return strings.Join(append(out, lines[i:]...), "\n")
 			}
-			if key, _, ok := parseMetadataLine(lines[i]); ok && key == "labels" {
-				lines[i] = labelLine
+			if key, _, ok := parseMetadataLine(lines[i]); ok && key == metaKey {
+				lines[i] = metaLine
 				return strings.Join(lines, "\n")
 			}
 		}
-		return strings.Join(append(lines, labelLine), "\n")
+		return strings.Join(append(lines, metaLine), "\n")
 	}
 
 	if start < len(lines) {
@@ -653,19 +765,71 @@ func setLabelsInSource(content string, labelsValue string) string {
 				if !ok {
 					break
 				}
-				if key == "labels" {
-					lines[end] = labelLine
+				if key == metaKey {
+					lines[end] = metaLine
 					return strings.Join(lines, "\n")
 				}
 				end++
 			}
 			out := append([]string(nil), lines[:end]...)
-			out = append(out, labelLine)
+			out = append(out, metaLine)
 			return strings.Join(append(out, lines[end:]...), "\n")
 		}
 	}
 
-	return "---\n" + labelLine + "\n---\n\n" + content
+	return "---\n" + metaLine + "\n---\n\n" + content
+}
+
+// removeMetadataFromSource deletes the front matter line for metaKey, if
+// present, from either front matter shape. Content without that key is
+// returned unchanged (modulo newline normalisation).
+func removeMetadataFromSource(content string, metaKey string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	if start >= len(lines) {
+		return content
+	}
+
+	removeAt := func(i int) string {
+		out := append([]string(nil), lines[:i]...)
+		return strings.Join(append(out, lines[i+1:]...), "\n")
+	}
+
+	if strings.TrimSpace(lines[start]) == "---" {
+		for i := start + 1; i < len(lines); i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			if trimmed == "" || trimmed == "---" {
+				return content
+			}
+			if key, _, ok := parseMetadataLine(lines[i]); ok && key == metaKey {
+				return removeAt(i)
+			}
+		}
+		return content
+	}
+
+	if key, _, ok := parseMetadataLine(lines[start]); ok && (key == "title" || key == "date") {
+		for i := start; i < len(lines); i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			if trimmed == "" {
+				return content
+			}
+			key, _, ok := parseMetadataLine(lines[i])
+			if !ok {
+				return content
+			}
+			if key == metaKey {
+				return removeAt(i)
+			}
+		}
+	}
+
+	return content
 }
 
 // ---------------------------------------------------------------------------
@@ -673,13 +837,16 @@ func setLabelsInSource(content string, labelsValue string) string {
 
 func cmdServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	dir := fs.String("dir", ".", "directory to serve")
+	dir := fs.String("dir", outputDir, "directory to serve")
 	port := fs.Int("port", 8000, "port to listen on")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	if info, err := os.Stat(*dir); err != nil || !info.IsDir() {
+		if *dir == outputDir {
+			return fmt.Errorf("no %s/ directory here — run `blog build` first", outputDir)
+		}
 		return fmt.Errorf("not a directory: %s", *dir)
 	}
 
@@ -894,6 +1061,13 @@ func buildSite(includeDrafts bool) error {
 	if err != nil {
 		return err
 	}
+
+	// Entries flagged `draft: true` in their front matter (the editor's draft
+	// workflow) only appear when drafts were asked for.
+	if !includeDrafts {
+		posts = withoutDrafts(posts)
+		ideas = withoutDrafts(ideas)
+	}
 	for i := range ideas {
 		ideas[i].Slug = "ideas/" + ideas[i].Slug
 	}
@@ -919,6 +1093,16 @@ func buildSite(includeDrafts bool) error {
 	}
 
 	return nil
+}
+
+func withoutDrafts(posts []post) []post {
+	var kept []post
+	for _, p := range posts {
+		if !p.IsDraft {
+			kept = append(kept, p)
+		}
+	}
+	return kept
 }
 
 // renderFeed writes an Atom feed to output/atom.xml covering every post and
@@ -1147,7 +1331,7 @@ func parsePost(path string, slug string, kind string, isDraft bool) (post, error
 		Slug:       sanitizeSlug(slug),
 		SourcePath: path,
 		Kind:       kind,
-		IsDraft:    isDraft,
+		IsDraft:    isDraft || meta["draft"] == "true",
 		Labels:     parseLabels(meta["labels"]),
 	}, nil
 }
@@ -1340,15 +1524,24 @@ func renderPost(p post, tmpl templates) error {
 	}
 	cssHref := postCSSName
 	searchHref := searchJSName
+	navHref := navJSName
 	rootPrefix := ""
 	if relToRoot != "." {
 		cssHref = filepath.ToSlash(filepath.Join(relToRoot, postCSSName))
 		searchHref = filepath.ToSlash(filepath.Join(relToRoot, searchJSName))
+		navHref = filepath.ToSlash(filepath.Join(relToRoot, navJSName))
 		rootPrefix = filepath.ToSlash(relToRoot) + "/"
 	}
 
 	header := rewriteIndexLinks(tmpl.Header[p.Kind], relToRoot)
 	footer := rewriteIndexLinks(tmpl.Footer[p.Kind], relToRoot)
+
+	// Title header for the page, unless the body already opens with its own
+	// h1 (older content carries `# title` in the markdown).
+	titleHeader := ""
+	if !startsWithH1(p.Body) {
+		titleHeader = fmt.Sprintf("<h1 class=\"post-title\">%s</h1>\n", html.EscapeString(p.Title))
+	}
 
 	page := fmt.Sprintf(`<!doctype html>
 <html lang="en">
@@ -1358,14 +1551,15 @@ func renderPost(p post, tmpl templates) error {
   <title>%s</title>
   <link rel="stylesheet" href="%s">
   <script src="%s" defer data-blog-root="%s"></script>
+  <script src="%s" defer></script>
 </head>
 <body>
-%s
-%s
+%s%s
+%s%s
 %s
 %s</body>
 </html>
-`, html.EscapeString(p.Title), cssHref, searchHref, rootPrefix, header, rendered.String(), footer, generatorFooter())
+`, html.EscapeString(p.Title), cssHref, searchHref, rootPrefix, navHref, navHeader(rootPrefix, ""), header, titleHeader, rendered.String(), footer, generatorFooter())
 
 	postPath := filepath.Join(postDir, indexFileName)
 	if err := os.WriteFile(postPath, []byte(page), 0o644); err != nil {
@@ -1375,19 +1569,56 @@ func renderPost(p post, tmpl templates) error {
 	return nil
 }
 
+// navHeader is emitted at the top of every generated page: the navigation bar
+// between the blog (posts) and ideas list pages. It is generated rather than
+// templated so every workspace gets it on rebuild, without template surgery.
+// The active section renders as a plain word; the other as a link.
+func navHeader(rootPrefix string, active string) string {
+	blogPart := fmt.Sprintf("<a href=\"%sindex.html\">blog</a>", rootPrefix)
+	if active == "blog" {
+		blogPart = "<span class=\"current\">blog</span>"
+	}
+	ideasPart := fmt.Sprintf("<a href=\"%sideas.html\">ideas</a>", rootPrefix)
+	if active == "ideas" {
+		ideasPart = "<span class=\"current\">ideas</span>"
+	}
+	return fmt.Sprintf(`<header class="site-nav">
+  <nav>
+    %s
+    %s
+  </nav>
+  <hr>
+</header>
+`, blogPart, ideasPart)
+}
+
 // generatorFooter is appended to every generated page: a discreet credit
 // naming the blogtool version that produced the output.
 func generatorFooter() string {
 	return fmt.Sprintf("<footer class=\"made-with\">made using <a href=\"https://github.com/simonski/blogtool\">blogtool</a> v%s</footer>\n", strings.TrimSpace(embeddedVersion))
 }
 
+// startsWithH1 reports whether the markdown body opens with a `# ` heading.
+func startsWithH1(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		return strings.HasPrefix(trimmed, "# ")
+	}
+	return false
+}
+
 func rewriteIndexLinks(content string, relToRoot string) string {
 	if relToRoot == "." {
 		return content
 	}
-	target := filepath.ToSlash(filepath.Join(relToRoot, indexFileName))
-	content = strings.ReplaceAll(content, `href="index.html"`, fmt.Sprintf(`href="%s"`, target))
-	content = strings.ReplaceAll(content, `href='index.html'`, fmt.Sprintf(`href='%s'`, target))
+	for _, name := range []string{indexFileName, ideasFileName} {
+		target := filepath.ToSlash(filepath.Join(relToRoot, name))
+		content = strings.ReplaceAll(content, fmt.Sprintf(`href="%s"`, name), fmt.Sprintf(`href="%s"`, target))
+		content = strings.ReplaceAll(content, fmt.Sprintf(`href='%s'`, name), fmt.Sprintf(`href='%s'`, target))
+	}
 	return content
 }
 
@@ -1508,60 +1739,63 @@ func seasonLabel(t time.Time) string {
 	}
 }
 
+// renderIndex writes the two top-level list pages: index.html (posts, grouped
+// by season) and ideas.html (ideas, one free-form list). The header template
+// carries the blog/ideas navigation bar between them.
 func renderIndex(posts []post, ideas []post, tmpl templates) error {
-	var postCol strings.Builder
+	var postList strings.Builder
 	currentSeason := ""
 	open := false
 	for _, p := range posts {
 		season := seasonLabel(p.Date)
 		if season != currentSeason {
 			if open {
-				postCol.WriteString("  </ul>\n</div>\n")
+				postList.WriteString("  </ul>\n</div>\n")
 			}
-			postCol.WriteString(fmt.Sprintf("<div class=\"season\">\n  <span class=\"season-date\">%s</span>\n  <ul>\n", html.EscapeString(season)))
+			postList.WriteString(fmt.Sprintf("<div class=\"season\">\n  <span class=\"season-date\">%s</span>\n  <ul>\n", html.EscapeString(season)))
 			currentSeason = season
 			open = true
 		}
-		postCol.WriteString(indexLink(p))
+		postList.WriteString(indexLink(p))
 	}
 	if open {
-		postCol.WriteString("  </ul>\n</div>\n")
+		postList.WriteString("  </ul>\n</div>\n")
+	}
+	if err := renderListPage(indexFileName, "Blog", "blog", postList.String(), tmpl); err != nil {
+		return err
 	}
 
-	// Posts on the left, ideas as a free-form second column on the right.
-	var links strings.Builder
-	links.WriteString("<div class=\"columns\">\n<div class=\"col col-posts\">\n")
-	links.WriteString(postCol.String())
-	links.WriteString("</div>\n")
-	if len(ideas) > 0 {
-		links.WriteString("<div class=\"col col-ideas\">\n<div class=\"season\">\n  <span class=\"season-date\">ideas</span>\n  <ul>\n")
-		for _, p := range ideas {
-			links.WriteString(indexLink(p))
-		}
-		links.WriteString("  </ul>\n</div>\n</div>\n")
+	var ideaList strings.Builder
+	ideaList.WriteString("<div class=\"season\">\n  <ul>\n")
+	for _, p := range ideas {
+		ideaList.WriteString(indexLink(p))
 	}
-	links.WriteString("</div>\n")
+	ideaList.WriteString("  </ul>\n</div>\n")
+	return renderListPage(ideasFileName, "Ideas", "ideas", ideaList.String(), tmpl)
+}
 
+func renderListPage(fileName string, title string, active string, listing string, tmpl templates) error {
 	page := fmt.Sprintf(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Blog</title>
+  <title>%s</title>
   <link rel="stylesheet" href="%s">
   <script src="%s" defer data-blog-root=""></script>
+  <script src="%s" defer></script>
 </head>
 <body>
-%s
+%s%s
 %s
 %s
 %s</body>
 </html>
-`, indexCSSName, searchJSName, tmpl.IndexHeader, links.String(), tmpl.IndexFooter, generatorFooter())
+`, html.EscapeString(title), indexCSSName, searchJSName, navJSName, navHeader("", active), tmpl.IndexHeader, listing, tmpl.IndexFooter, generatorFooter())
 
-	indexPath := filepath.Join(outputDir, indexFileName)
-	if err := os.WriteFile(indexPath, []byte(page), 0o644); err != nil {
-		return fmt.Errorf("write index page: %w", err)
+	pagePath := filepath.Join(outputDir, fileName)
+	if err := os.WriteFile(pagePath, []byte(page), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", fileName, err)
 	}
 	return nil
 }
